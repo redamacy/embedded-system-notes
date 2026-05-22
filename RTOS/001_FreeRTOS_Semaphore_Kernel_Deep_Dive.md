@@ -78,9 +78,18 @@ osSemaphoreNew(1, 0, &attr)                         // CMSIS-RTOS2 wrapper
 │ pcHead ─────────→ 指向自身 (因为 uxItemSize=0)        │
 │ pcWriteTo ──────→ = pcHead                           │
 │                                                      │
-│ u.xSemaphore:                                        │
-│   xMutexHolder       = NULL    (非 mutex 不用)        │
-│   uxRecursiveCallCount = 0                            │
+│ u.xQueue:                               ← ★ 初始化时访问 xQueue 侧   │
+│   pcTail             = pcHead                          │
+│   pcReadFrom         = pcHead                          │
+│                                                       │
+│   同一块内存的 xSemaphore 视角 (仅在 mutex 操作时使用):   │
+│     xMutexHolder       = NULL                          │
+│     uxRecursiveCallCount = 0                            │
+│                                                        │
+│ ⚠️ 即使 ucQueueType == queueQUEUE_TYPE_BINARY_SEMAPHORE, │
+│ prvInitialiseNewQueue → xQueueGenericReset 统一走       │
+│ u.xQueue 路径初始化 pcTail/pcReadFrom。                  │
+│ Semaphore 不"另起炉灶"，它复用 Queue 的全部操作原语。     │
 │                                                      │
 │ xTasksWaitingToSend:                                 │
 │   uxNumberOfItems   = 0                              │
@@ -116,6 +125,144 @@ osSemaphoreNew(1, 0, &attr)                         // CMSIS-RTOS2 wrapper
 | Take/Receive | `uxMessagesWaiting--` |
 
 **不分配数据存储区** — 信号量不需要 `pcHead → ... → pcTail` 的环形缓冲。这就是为什么 `pvPortMalloc(sizeof(Queue_t) + 0)` 只分配控制块。
+
+---
+
+### 3.1 深入：xTasksWaitingToSend 与 xTasksWaitingToReceive
+
+这两个链表是 Queue/Semaphore 的 **阻塞调度核心**。理解它们，就理解了 FreeRTOS 任务间同步的底层。
+
+#### 3.1.1 List_t 数据结构
+
+```c
+// FreeRTOS list.h — 内核最小通用数据结构
+
+// 链表头 (嵌入在 Queue_t 中)
+typedef struct xLIST {
+    volatile UBaseType_t uxNumberOfItems;   // 链表中有几个节点
+    ListItem_t          *pxIndex;           // 遍历游标 (指向当前遍历位置)
+    MiniListItem_t       xListEnd;          // ★ 哨兵节点 — 不是真正的任务
+} List_t;
+
+// 完整节点 (存在 TCB 里: xEventListItem / xStateListItem)
+struct xLIST_ITEM {
+    TickType_t            xItemValue;       // ★ 排序键值 — 按优先级或 tick 排序
+    struct xLIST_ITEM    *pxNext;           // 双向链表 → 后继
+    struct xLIST_ITEM    *pxPrevious;       // 双向链表 → 前驱
+    void                 *pvOwner;          // ★ 指向拥有者 TCB
+    struct xLIST         *pvContainer;      // 反向指向所属的 List_t
+};
+
+// 迷你节点 (只用于 xListEnd — 不存 pvOwner/pvContainer)
+struct xMINI_LIST_ITEM {
+    TickType_t            xItemValue;
+    struct xLIST_ITEM    *pxNext;
+    struct xLIST_ITEM    *pxPrevious;
+};
+```
+
+**关键设计：`xListEnd` 是一个不能移走的"锚"。** 它永远在链表中，双向循环链表的空/非空判断靠它：
+
+```
+空链表:                              非空链表 (1个节点):
+┌──────────────┐                     ┌──────────────┐
+│  xListEnd    │                     │  xListEnd    │
+│  pxNext ───────┐                   │  pxNext ──────────┐
+│  pxPrev ───┐   │                   │  pxPrev ──────┐   │
+└────────────│───┘                   └───────────────│───┘
+             │   ┌─────────────────┐                  │   ┌──────────────────────┐
+             └──→│ xListEnd (自己) │                  │   │ xEventListItem (TCB) │
+             ←───│                 │                  │   │ xItemValue = 15(pri) │
+                 └─────────────────┘                  │   │ pxNext ──────────┐   │
+                                                      │   │ pxPrev ───┐      │   │
+                                                      │   │ pvOwner=TCB      │   │
+                                                      │   └──────────│───────┘   │
+                                                      └──────────────┘           │
+                                                          ↑                      │
+                                                          └──────────────────────┘
+                                                               (双向闭环)
+```
+
+#### 3.1.2 xTasksWaitingToReceive — 等"Take"的任务链表
+
+**谁挂在这里？** 调用 `osSemaphoreAcquire()` / `xQueueReceive()` 时，`uxMessagesWaiting == 0`（队列/信号量为空），且 `xTicksToWait > 0` 的任务。
+
+**代码路径：** 见第 5 节 `vTaskPlaceOnEventList(&pxQueue->xTasksWaitingToReceive, ...)`。
+
+**排序规则：按任务优先级降序**（`xItemValue = uxPriority`）→ 优先级最高的任务排在最前面，最先被唤醒。
+
+**工程场景：FG14_Receive_Task** 在 `uxMessagesWaiting == 0` 时调用 `osSemaphoreAcquire(portMAX_DELAY)`：
+
+```
+初始 (FG14_Receive_Task 阻塞前):
+  xTasksWaitingToReceive:
+    uxNumberOfItems = 0
+    pxIndex → &xListEnd
+    xListEnd.pxNext → &xListEnd    ← 空，自己指自己
+
+阻塞后:
+  xTasksWaitingToReceive:
+    uxNumberOfItems = 1
+    pxIndex → &xListEnd
+    xListEnd.pxNext → FG14_Receive_Task.xEventListItem
+      .xItemValue  = 15  (优先级)
+      .pvOwner     → &FG14_Receive_TCB
+      .pvContainer → &xTasksWaitingToReceive
+    xListEnd.pxPrev ← 同上
+```
+
+**唤醒时机：** `osSemaphoreRelease()` → `xQueueGenericSend()` → 检测到 `!listLIST_IS_EMPTY(&xTasksWaitingToReceive)` → `xTaskRemoveFromEventList()` → 从链表中取出最高优先级的 TCB → 从 DelayedList 摘除 → 插入 ReadyList。
+
+**多任务等待时：** 假设同时有 prio 15 和 prio 13 两个任务在等：
+
+```
+xTasksWaitingToReceive (按优先级降序排列):
+  xListEnd → Task(15).xEventListItem → Task(13).xEventListItem → xListEnd (闭环)
+              ↑ 头部 — 最先被唤醒        ↑ 尾部
+```
+
+#### 3.1.3 xTasksWaitingToSend — 等"Give"的任务链表
+
+**谁挂在这里？** 调用 `osSemaphoreRelease()` / `xQueueSend()` 时，队列已满（`uxMessagesWaiting == uxLength`），且 `xTicksToWait > 0` 的任务。
+
+**对于你的二值信号量 `(max_count=1)`：** 当 `uxMessagesWaiting` 已经从 0 变成 1（已被 Give 过一次但还没被 Take），此时再有人 Give 且愿意等待，就会挂入此链表。
+
+**但在你的工程中实际不触发：** 因为所有 `osSemaphoreRelease` 调用都在 ISR 中（`xTicksToWait=0`），不会阻塞等待。所以 `xTasksWaitingToSend` 始终保持**空链表**。
+
+```
+你的工程 4 个信号量的 xTasksWaitingToSend — 始终为空:
+
+  xTasksWaitingToSend:
+    uxNumberOfItems = 0
+    xListEnd.pxNext → &xListEnd     ← 无人等待 Give
+```
+
+**何时会用到：** 如果某个 **任务**（非 ISR）调用 `osSemaphoreRelease()` 但信号量已满，且指定了等待超时 `xTicksToWait > 0`，该任务就会挂到这里等待被 Take 清出空间。
+
+#### 3.1.4 两个链表的关系
+
+```
+                    Queue_t (信号量)
+                   ┌─────────────────────────────┐
+                   │ uxMessagesWaiting = 0        │  ← 当前计数
+                   │ uxLength = 1                 │  ← 容量上限
+                   │                              │
+GIVE 方向 ←──      │ xTasksWaitingToSend           │      ──→ TAKE 方向
+(放令牌)           │   (空 — 无人等待 Give)         │           (取令牌)
+                   │                              │
+                   │ xTasksWaitingToReceive        │
+                   │   Task(15).xEventListItem     │  ← 在等令牌的任务们
+                   │   Task(13).xEventListItem     │
+                   └─────────────────────────────┘
+
+规则:
+  • uxMessagesWaiting == 0  → Take 方阻塞 → 挂入 xTasksWaitingToReceive
+  • uxMessagesWaiting >= uxLength → Give 方阻塞 → 挂入 xTasksWaitingToSend
+  • Give 成功后 → 优先唤醒 xTasksWaitingToReceive (如果有)
+  • Take 成功后 → 优先唤醒 xTasksWaitingToSend (如果有)
+```
+
+**设计精妙：** FreeRTOS 用同一个 `List_t` 结构 + 同一套 `vListInsert`/`uxListRemove` 操作原语，统一了消息队列的"满阻塞"和信号量的"空阻塞"两种互逆的阻塞场景。代码复用率接近 100%。两个链表配合 `uxMessagesWaiting` 计数器，天然形成了一个 **生产者-消费者阻塞队列**。
 
 ---
 
