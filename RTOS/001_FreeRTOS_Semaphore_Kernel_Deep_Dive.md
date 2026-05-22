@@ -266,6 +266,531 @@ GIVE 方向 ←──      │ xTasksWaitingToSend           │      ──→ 
 
 ---
 
+### 3.2 创建过程逐行追踪：每一步，每一个值
+
+从 `FG14ReceiveSemaphoreHandle = osSemaphoreNew(1, 0, ...)` 开始，追踪到两个链表初始化的最后一条汇编。
+
+#### 3.2.1 调用链概览
+
+```
+osSemaphoreNew(1, 0, &attr)                    // CMSIS-RTOS2 wrapper
+  └── xSemaphoreCreateBinary()                  // semphr.h 内联宏
+        └── xQueueGenericCreate(               // queue.c
+              uxQueueLength = 1,
+              uxItemSize    = 0,                // ← queueSEMAPHORE_QUEUE_ITEM_LENGTH
+              ucQueueType   = queueQUEUE_TYPE_BINARY_SEMAPHORE
+            )
+              │
+              ├── pvPortMalloc(sizeof(Queue_t) + 1*0)  // 只分配控制块，无数据区
+              │     ↓ 返回一块 88+ 字节的堆内存，假设地址为 0x2000_1000
+              │
+              └── prvInitialiseNewQueue(1, 0, 0x2000_1000, BINARY_SEMAPHORE, pxNewQueue)
+                    │
+                    ├── pxNewQueue->pcHead     = (int8_t *)pxNewQueue    // = 0x2000_1000
+                    ├── pxNewQueue->uxLength   = 1
+                    ├── pxNewQueue->uxItemSize = 0
+                    └── xQueueGenericReset(pxNewQueue, pdTRUE)
+                          │
+                          ├── vListInitialise(&pxQueue->xTasksWaitingToSend)
+                          ├── vListInitialise(&pxQueue->xTasksWaitingToReceive)
+                          └── 初始化 pcWriteTo, u.xQueue.pcTail, u.xQueue.pcReadFrom,
+                              uxMessagesWaiting=0, cRxLock=-1, cTxLock=-1
+```
+
+#### 3.2.2 核心：vListInitialise 逐条分析
+
+`xQueueGenericReset` 中对两个链表的初始化是**完全对称**的。以 `xTasksWaitingToSend` 为例：
+
+```c
+// 调用: vListInitialise(&pxQueue->xTasksWaitingToSend);
+//
+// 参数: pxList = &pxQueue->xTasksWaitingToSend
+//       即指向 Queue_t 内 xTasksWaitingToSend 字段的指针
+```
+
+```c
+// ★ 语句 1
+pxList->pxIndex = (ListItem_t *) &(pxList->xListEnd);
+```
+
+**效果：** `pxIndex` 指针指向 `xListEnd` 节点自身。
+**为什么指向 xListEnd？** `pxIndex` 是遍历游标，`vListInsert` 用它确定插入位置。空链表时，唯一可指向的就是哨兵。实际插入操作不看 `pxIndex`，而是用 `xItemValue` 排序——但 `pxIndex` 必须非 NULL。
+
+```
+此时:
+  pxIndex ───→ &xListEnd   (即 &pxList->xListEnd)
+```
+
+```c
+// ★ 语句 2
+pxList->uxNumberOfItems = (UBaseType_t) 0U;
+```
+
+**效果：** 计数器清零——链表里没有任务节点的原因是还没有人阻塞在这个信号量上。
+
+```c
+// ★ 语句 3
+pxList->xListEnd.xItemValue = (TickType_t) portMAX_DELAY;
+```
+
+**效果：** 哨兵节点的排序值设为最大值 `0xFFFF_FFFF`。
+**为什么？** 任务按优先级降序排列（数值大排前面）。`xListEnd` 作为哨兵，值设为最大保证新节点按优先级插入时，哨兵永远在列表"末尾"（也是"开头"，因为是双向闭环）。这是一个巧妙的边界处理：任何任务的优先级 ≤ `configMAX_PRIORITIES`（通常 ≤ 32），远小于 `portMAX_DELAY`，所以任何新节点都会排在 `xListEnd` 的"前面"。
+
+```c
+// ★ 语句 4 — 关键！
+pxList->xListEnd.pxNext = (ListItem_t *) &(pxList->xListEnd);
+```
+
+**效果：** 哨兵的 `pxNext` 指向哨兵自己。
+
+```c
+// ★ 语句 5 — 关键！
+pxList->xListEnd.pxPrevious = (ListItem_t *) &(pxList->xListEnd);
+```
+
+**效果：** 哨兵的 `pxPrevious` 也指向哨兵自己。
+
+#### 3.2.3 初始化完成后：两个链表的完整状态
+
+`vListInitialise` 执行两次后，`xTasksWaitingToSend` 和 `xTasksWaitingToReceive` 的**每一个字段**如下：
+
+```
+     ╔══════════════════════════════════════════════════════════╗
+     ║          xTasksWaitingToSend (sizeof = 20 bytes)          ║
+     ╠══════════════════════════════════════════════════════════╣
+     ║                                                            ║
+     ║  uxNumberOfItems = 0                    ← 空，无等待者     ║
+     ║                                                            ║
+     ║  pxIndex ──────────────────────────┐                      ║
+     ║                                     │  指向哨兵自身        ║
+     ║  xListEnd:                          ↓                      ║
+     ║    .xItemValue  = 0xFFFF_FFFF       (portMAX_DELAY)        ║
+     ║    .pxNext      = &xListEnd  ←──┐   (指向自身)            ║
+     ║    .pxPrevious  = &xListEnd  ←──┼── (指向自身)            ║
+     ║                                   │                        ║
+     ║    可视化:                         │                        ║
+     ║         ┌──────────────────────┐   │                        ║
+     ║         │     xListEnd         │   │                        ║
+     ║         │  xItemValue=0xFFFF.. │   │                        ║
+     ║         │  pxNext ─────────────┼───┘                        ║
+     ║         │  pxPrev ─────────────┼───┐                        ║
+     ║         └──────────────────────┘   │                        ║
+     ║              ↑                     │                        ║
+     ║              └─────────────────────┘                        ║
+     ║               (自己指自己，闭环)                              ║
+     ╚══════════════════════════════════════════════════════════╝
+
+     ╔══════════════════════════════════════════════════════════╗
+     ║        xTasksWaitingToReceive (sizeof = 20 bytes)         ║
+     ╠══════════════════════════════════════════════════════════╣
+     ║                                                            ║
+     ║  uxNumberOfItems = 0                    ← 空，无等待者     ║
+     ║                                                            ║
+     ║  pxIndex ──────────────────────────┐                      ║
+     ║                                     │                      ║
+     ║  xListEnd:                          ↓                      ║
+     ║    .xItemValue  = 0xFFFF_FFFF       (portMAX_DELAY)        ║
+     ║    .pxNext      = &xListEnd  ←──┐   (指向自身)            ║
+     ║    .pxPrevious  = &xListEnd  ←──┼── (指向自身)            ║
+     ║                                   │                        ║
+     ║    可视化: (与上面完全一样，空链表)    │                        ║
+     ║         ┌──────────────────────┐   │                        ║
+     ║         │     xListEnd         │   │                        ║
+     ║         │  xItemValue=0xFFFF.. │   │                        ║
+     ║         │  pxNext ─────────────┼───┘                        ║
+     ║         │  pxPrev ─────────────┼───┐                        ║
+     ║         └──────────────────────┘   │                        ║
+     ║              ↑                     │                        ║
+     ║              └─────────────────────┘                        ║
+     ╚══════════════════════════════════════════════════════════╝
+```
+
+**此时整个 `Queue_t` 在内存中的完整布局（两个链表 + 队列控制字段）：**
+
+```
+地址          内容                       所属字段
+───────────  ────────────────────────   ─────────────────────────
+0x2000_1000  → 0x2000_1000              pcHead (指向Queue_t自身)
+0x2000_1004  → 0x2000_1000              pcWriteTo
+0x2000_1008  → ...                      u 联合体起始
+               (xQueue.pcTail / xSemaphore.xMutexHolder — 复用同一内存)
+0x2000_100C  → ...                      (xQueue.pcReadFrom / xSemaphore.uxRecursiveCallCount)
+              
+              ── xTasksWaitingToSend ──
+0x2000_1010  0x0000_0000                uxNumberOfItems = 0
+0x2000_1014  → &xListEnd (即 0x2000_1018)  pxIndex
+0x2000_1018  0xFFFF_FFFF                xListEnd.xItemValue = portMAX_DELAY
+0x2000_101C  → 0x2000_1018              xListEnd.pxNext → 自己
+0x2000_1020  → 0x2000_1018              xListEnd.pxPrevious → 自己
+              
+              ── xTasksWaitingToReceive ──
+0x2000_1024  0x0000_0000                uxNumberOfItems = 0
+0x2000_1028  → &xListEnd (即 0x2000_102C)  pxIndex
+0x2000_102C  0xFFFF_FFFF                xListEnd.xItemValue = portMAX_DELAY
+0x2000_1030  → 0x2000_102C              xListEnd.pxNext → 自己
+0x2000_1034  → 0x2000_102C              xListEnd.pxPrevious → 自己
+              
+              ── 队列控制 ──
+0x2000_1038  0x0000_0000                uxMessagesWaiting = 0
+0x2000_103C  0x0000_0001                uxLength = 1
+0x2000_1040  0x0000_0000                uxItemSize = 0
+0x2000_1044  0xFFFF_FFFF (-1)           cRxLock = queueUNLOCKED
+0x2000_1048  0xFFFF_FFFF (-1)           cTxLock = queueUNLOCKED
+...          ...                        (后续字段省略)
+```
+
+**关键观察：** 两个链表在 Queue_t 中**紧挨着存放**。每个 `List_t` 占 20 字节（`uxNumberOfItems` 4 + `pxIndex` 4 + `MiniListItem_t` 12）。两个链表在内存中的物理位置相邻，但逻辑上完全独立——分别管理"等 Take"和"等 Give"两个方向的任务。
+
+---
+
+### 3.3 Release (Give) 时的链表变化：完整路径
+
+以工程实际场景：**RAIL 中断中 `osSemaphoreRelease(FG14ReceiveSemaphoreHandle)`**。
+
+#### 3.3.1 场景：还没有任务在等 Take
+
+这是最常见的情况——信号量刚创建，还没有任务调过 `osSemaphoreAcquire`。
+
+```
+调用前状态:
+  uxMessagesWaiting = 0
+  xTasksWaitingToSend    = 空
+  xTasksWaitingToReceive = 空
+```
+
+**调用链：**
+
+```
+osSemaphoreRelease(sem)                          // CMSIS-RTOS2 (ISR 上下文中调用 xSemaphoreGiveFromISR)
+  └── xSemaphoreGiveFromISR(sem, &xHigherPriorityTaskWoken)  // FreeRTOS ISR 版
+        └── xQueueGenericSendFromISR(pxQueue, NULL, &xHigherPriorityTaskWoken, queueSEND_TO_BACK)
+              // pxQueue->uxMessagesWaiting (0) < pxQueue->uxLength (1) → 可以 Give
+              │
+              ├── prvCopyDataToQueue()           // uxItemSize=0 → 不 memcpy
+              │     └── uxMessagesWaiting = 1    // ★ 0 → 1
+              │
+              └── 检查 xTasksWaitingToReceive
+                    └── uxNumberOfItems = 0 → 空，无人等待
+                        → 不做任何唤醒
+                        → 返回
+```
+
+**结果：**
+
+```
+调用后状态:
+  uxMessagesWaiting = 1           ← ★ 多了一个"令牌"
+  xTasksWaitingToSend    = 空     ← 未变
+  xTasksWaitingToReceive = 空     ← 未变
+
+                       仅计数器 +1
+                   两个链表毫无变化
+```
+
+用图表示：
+
+```
+  Release 前:                            Release 后:
+
+  ┌─ FG14ReceiveSemaphore ─┐           ┌─ FG14ReceiveSemaphore ─┐
+  │ uxMessagesWaiting = 0   │           │ uxMessagesWaiting = 1   │  ← 变了
+  │ uxLength = 1            │           │ uxLength = 1            │
+  │                          │           │                          │
+  │ Send 链表: 空            │           │ Send 链表: 空            │  ← 没变
+  │   [xListEnd ←→ 自己]     │   ──→    │   [xListEnd ←→ 自己]     │
+  │                          │           │                          │
+  │ Receive 链表: 空          │           │ Receive 链表: 空          │  ← 没变
+  │   [xListEnd ←→ 自己]     │           │   [xListEnd ←→ 自己]     │
+  └──────────────────────────┘           └──────────────────────────┘
+```
+
+**如果此时再有第二次 Release 且 `xTicksToWait=0`：** `uxMessagesWaiting (1) >= uxLength (1)` → 满！返回失败，`uxMessagesWaiting` 保持 1。两个链表依然不变。
+
+#### 3.3.2 场景：有任务在等 Take（Release 唤醒等待者）
+
+这是系统运行中的正常路径：FG14_Receive_Task 已经调了 `osSemaphoreAcquire` 并阻塞，RAIL 中断到达。
+
+```
+调用前状态:
+  uxMessagesWaiting = 0                              ← 无令牌
+  xTasksWaitingToSend    = 空
+  xTasksWaitingToReceive = [ FG14_Receive_Task(15) ]  ← 有一个等待者
+
+  xTasksWaitingToReceive 链表展开:
+    ┌──────────────┐
+    │  xListEnd    │
+    │  xItemValue  │ = 0xFFFF_FFFF (哨兵)
+    │  pxNext ─────┼───→ ┌─────────────────────────┐
+    │  pxPrev ─────┼──←──│ TCB.xEventListItem      │
+    └──────────────┘     │  .xItemValue = 15        │  ← 按优先级排序
+                          │  .pxNext ─────→ &xListEnd│
+                          │  .pxPrev ─────→ &xListEnd│
+                          │  .pvOwner  ───→ &TCB    │  ← 指向 FG14_Receive_Task
+                          │  .pvContainer → &ReceiveList│
+                          └─────────────────────────┘
+```
+
+**调用链（ISR 版本）：**
+
+```
+xQueueGenericSendFromISR(pxQueue, NULL, &xHigherPriorityTaskWoken, queueSEND_TO_BACK)
+  │
+  ├── uxMessagesWaiting (0) < uxLength (1) → 可以 Give
+  │
+  ├── prvCopyDataToQueue()
+  │     └── uxMessagesWaiting = 1       // 0 → 1
+  │
+  └── if (!listLIST_IS_EMPTY(&pxQueue->xTasksWaitingToReceive))
+      │   // uxNumberOfItems = 1, NOT empty!
+      │
+      └── xTaskRemoveFromEventList(&pxQueue->xTasksWaitingToReceive)
+            │
+            ├── ① 取出链表头部: pxUnblockedTCB = (TCB_t *)(xListEnd.pxNext->pvOwner)
+            │      = FG14_Receive_Task 的 TCB
+            │
+            ├── ② uxListRemove(&pxUnblockedTCB->xEventListItem)
+            │      ★ 从 xTasksWaitingToReceive 摘除 xEventListItem
+            │      ★ uxNumberOfItems: 1 → 0
+            │      ★ xListEnd.pxNext → &xListEnd, xListEnd.pxPrev → &xListEnd  (恢复空链表)
+            │
+            ├── ③ 因为 uxSchedulerSuspended == pdFALSE (调度器未挂起)
+            │      uxListRemove(&pxUnblockedTCB->xStateListItem)
+            │      ★ 从 DelayedList 摘除 xStateListItem
+            │
+            │      prvAddTaskToReadyList(pxUnblockedTCB)
+            │      ★ 插入 ReadyList[15] (任务回到就绪态)
+            │
+            └── ④ pxUnblockedTCB->uxPriority(15) > pxCurrentTCB->uxPriority(?)
+                  → 如果是 ISR 上下文，通常返回 pdTRUE，设置 *pxHigherPriorityTaskWoken
+                  → ISR 返回时触发 PendSV 上下文切换
+```
+
+**链表变化过程：**
+
+```
+  ★ 步骤②之前 (uxListRemove 调用前):
+
+  xTasksWaitingToReceive:                  TCB.xEventListItem:
+  ┌────────────────────┐                  ┌──────────────────────┐
+  │ uxNumberOfItems = 1│                  │ .xItemValue = 15     │
+  │ pxIndex → ...      │                  │ .pxNext → &xListEnd  │
+  │                    │   ←──────────→   │ .pxPrev → &xListEnd  │
+  │ xListEnd:          │                  │ .pvOwner → &TCB      │
+  │  .pxNext ──────────┼──→              │ .pvContainer → List  │
+  │  .pxPrev ──────────┼──←              └──────────────────────┘
+  └────────────────────┘
+
+  ★ 步骤②之后 (uxListRemove 完成):
+
+  xTasksWaitingToReceive:                  TCB.xEventListItem:
+  ┌────────────────────┐                  ┌──────────────────────┐
+  │ uxNumberOfItems = 0│                  │ .pxNext = ???        │ ← 被uxListRemove清
+  │ pxIndex → &xListEnd│                  │ .pxPrev = ???        │
+  │                    │    (断开连接)      │ .pvOwner → &TCB     │ ← pvOwner 不变
+  │ xListEnd:          │                  │ .pvContainer = NULL  │ ← 被uxListRemove清
+  │  .pxNext → &xListEnd│ ← 恢复自指     └──────────────────────┘
+  │  .pxPrev → &xListEnd│
+  └────────────────────┘
+
+  同时: TCB.xStateListItem 从 DelayedList 移到 ReadyList[15]
+```
+
+**最终状态：**
+
+```
+Release 完成后:
+  uxMessagesWaiting = 1           ← 计数器+1 (虽然立即被唤醒的任务消费)
+  xTasksWaitingToSend    = 空     ← 未变
+  xTasksWaitingToReceive = 空     ← ★ 从 1 项变回空 — 等待者被移走了
+
+  FG14_Receive_Task: 从 Blocked 态 → Ready 态 (在 ReadyList[15] 中)
+```
+
+---
+
+### 3.4 Acquire (Take) 时的链表变化：完整路径
+
+以工程实际场景：**FG14_Receive_Task 调用 `osSemaphoreAcquire(FG14ReceiveSemaphoreHandle, portMAX_DELAY)`**。
+
+#### 3.4.1 场景：信号量有令牌（uxMessagesWaiting > 0）
+
+```
+调用前状态:
+  uxMessagesWaiting = 1            ← 有令牌（比如刚被 ISR Give 过）
+  xTasksWaitingToSend    = 空
+  xTasksWaitingToReceive = 空
+```
+
+**调用链：**
+
+```
+osSemaphoreAcquire(sem, portMAX_DELAY)
+  └── xSemaphoreTake(sem, portMAX_DELAY)
+        └── xQueueSemaphoreTake(pxQueue, portMAX_DELAY)
+              │
+              ├── taskENTER_CRITICAL()
+              ├── uxSemaphoreCount = pxQueue->uxMessagesWaiting = 1
+              ├── if (uxSemaphoreCount > 0)  → TRUE!
+              │     │
+              │     ├── pxQueue->uxMessagesWaiting = 1 - 1 = 0   // ★ 1 → 0
+              │     │
+              │     └── if (!listLIST_IS_EMPTY(&pxQueue->xTasksWaitingToSend))
+              │           // uxNumberOfItems = 0 → 空，跳过
+              │           // (没有人阻塞在 Give 上等待空间)
+              │
+              └── taskEXIT_CRITICAL()
+              → 返回 pdPASS —— 立即成功，连阻塞都没进！
+```
+
+**结果：**
+
+```
+调用前:                                  调用后:
+  uxMessagesWaiting = 1                    uxMessagesWaiting = 0    ← 令牌被消费
+  Send 链表: 空                            Send 链表: 空             ← 未变
+  Receive 链表: 空                          Receive 链表: 空          ← 未变
+
+              没有任何链表被操作，全程只改了 uxMessagesWaiting
+```
+
+这正是信号量机制的"热路径"——大多数时候没有竞争，就是一个简单的计数器减一操作。两个链表在整个过程中连碰都没被碰。
+
+#### 3.4.2 场景：信号量无令牌 + 任务阻塞（关键场景）
+
+这是系统启动后的首次 Acquire——信号量刚创建，`uxMessagesWaiting = 0`，还没有人 Give。
+
+```
+调用前状态:
+  uxMessagesWaiting = 0            ← 无令牌
+  xTasksWaitingToSend    = 空
+  xTasksWaitingToReceive = 空      ← 还没有任务在等
+```
+
+**调用链（逐函数展开，标出每一步对链表的影响）：**
+
+```
+xQueueSemaphoreTake(pxQueue, portMAX_DELAY)
+  │
+  ├── ① taskENTER_CRITICAL()           // 关中断
+  │     uxSemaphoreCount = pxQueue->uxMessagesWaiting = 0
+  │
+  ├── ② if (uxSemaphoreCount > 0) → FALSE (0 > 0 is false)
+  │     进入 else 分支 — 没有令牌，准备阻塞
+  │
+  ├── ③ if (xTicksToWait == 0) → FALSE (portMAX_DELAY != 0)
+  │     if (xEntryTimeSet == pdFALSE) → 记录进入时间
+  │
+  ├── ④ taskEXIT_CRITICAL()            // 开中断！
+  │     ★ 此时中断仍能 fire。如果在 vTaskSuspendAll 之前
+  │     ISR 调了 xSemaphoreGiveFromISR，令牌会先被放入
+  │     （cRxLock/cTxLock 机制处理这个竞态）
+  │
+  ├── ⑤ vTaskSuspendAll()              // 挂起调度器，但不断中断
+  │
+  ├── ⑥ prvLockQueue(pxQueue)          // cRxLock/cTxLock 设为 queueLOCKED_UNMODIFIED
+  │
+  ├── ⑦ if (prvIsQueueEmpty(pxQueue))  // uxMessagesWaiting 还是 0 吗？
+  │     → TRUE（ISR 没在此期间 Give）
+  │     │
+  │     ├── ★ vTaskPlaceOnEventList(
+  │     │         &pxQueue->xTasksWaitingToReceive,   // 目标：Receive 链表
+  │     │         portMAX_DELAY                       // 永不超时
+  │     │       )
+  │     │     │
+  │     │     ├── ⑦a. vListInsert(&xTasksWaitingToReceive, &pxCurrentTCB->xEventListItem)
+  │     │     │
+  │     │     │     ★ vListInsert 按 xItemValue 降序插入
+  │     │     │     ★ xEventListItem.xItemValue = pxCurrentTCB->uxPriority = 15
+  │     │     │     ★ 空链表 → 直接插入在 xListEnd 的"前面"（即 pxNext 方向）
+  │     │     │
+  │     │     │     插入后链表:
+  │     │     │     ┌──────────────┐
+  │     │     │     │  xListEnd    │
+  │     │     │     │  xItemValue  │ = 0xFFFF_FFFF (哨兵)
+  │     │     │     │  pxNext ─────┼───→ ┌─────────────────────────┐
+  │     │     │     │  pxPrev ─────┼──←──│ TCB.xEventListItem      │
+  │     │     │     └──────────────┘     │  .xItemValue = 15        │
+  │     │     │                           │  .pxNext ─────→ &xListEnd│
+  │     │     │                           │  .pxPrev ─────→ &xListEnd│
+  │     │     │                           │  .pvOwner  ───→ &TCB    │
+  │     │     │                           │  .pvContainer → &ReceiveList│
+  │     │     │                           └─────────────────────────┘
+  │     │     │
+  │     │     │     uxNumberOfItems: 0 → 1
+  │     │     │
+  │     │     └── ⑦b. prvAddCurrentTaskToDelayedList(portMAX_DELAY, pdTRUE)
+  │     │           ★ TCB.xStateListItem 从 ReadyList[15] 移到 DelayedList
+  │     │           ★ 任务状态: Running → Blocked
+  │     │
+  │     ├── prvUnlockQueue(pxQueue)
+  │     │
+  │     └── if (xTaskResumeAll() == pdFALSE)  // 恢复调度器
+  │           ★ 当前任务已不在 ReadyList → 调度器选新任务
+  │           → portYIELD_WITHIN_API()
+  │           → PendSV → 上下文切换到下一个最高优先级就绪任务
+  │
+  └── ★ 注意: 代码不会立刻返回到 FG14_Receive_Task
+        因为 PendSV 已经把 CPU 切走了。下次被唤醒时会从
+        portYIELD_WITHIN_API() 之后继续执行 for(;;) 循环，
+        重新检查 uxMessagesWaiting，此时 > 0，走"有令牌"路径。
+```
+
+**链表变化总结：**
+
+```
+
+  Acquire 前（信号量为空，任务准备阻塞）:
+  ═══════════════════════════════════════════════
+  FG14_Receive_Task: Running 态 (pxCurrentTCB)
+  ReadyList[15]:     [FG14_Receive_Task, ...]
+  DelayedList:       空
+  xTasksWaitingToReceive: 空 [xListEnd ←→ 自己]
+  uxMessagesWaiting: 0
+
+
+  Acquire 后（vTaskPlaceOnEventList 完成）:
+  ═══════════════════════════════════════════════
+  FG14_Receive_Task: Blocked 态 (在事件链表中)
+  ReadyList[15]:     [其他任务]              ← FG14移除了
+  DelayedList:       [FG14_Receive_Task]      ← STATE 链表
+  xTasksWaitingToReceive: [FG14_Receive_Task] ← EVENT 链表
+  uxMessagesWaiting: 0
+  pxCurrentTCB:      → 下一个最高就绪任务      ← 已切换
+
+  ★ 同一个 TCB 同时出现在两个链表中:
+    • TCB.xStateListItem   → DelayedList (超时管理)
+    • TCB.xEventListItem   → xTasksWaitingToReceive (事件等待)
+```
+
+#### 3.4.3 场景：Acquire 时 xTasksWaitingToSend 有人等
+
+这个问题反过来了：假如信号量有令牌（`uxMessagesWaiting = 1`），Take 成功后计数器变成 0，此时检查 `xTasksWaitingToSend`。
+
+```
+调用前:
+  uxMessagesWaiting = 1
+  xTasksWaitingToSend = [某任务 TaskX 阻塞在 Give 上 — 信号量满时它想 Give]
+                         (在你的工程中从不发生，但机制如此)
+  xTasksWaitingToReceive = 空
+
+xQueueSemaphoreTake:
+  uxMessagesWaiting = 1 - 1 = 0        // 消费令牌
+  检查 xTasksWaitingToSend → 不空！
+  xTaskRemoveFromEventList(&xTasksWaitingToSend)
+    → TaskX 从 xTasksWaitingToSend 摘除
+    → TaskX.xStateListItem: DelayedList → ReadyList[priority]
+    → TaskX 现在可以 Give 了（因为消费令牌后有了空间）
+
+结果:
+  uxMessagesWaiting = 0         (刚才 1→0, 然后被 TaskX Give → 1, 取决于调度顺序)
+  但实际上 Take 代码返回前 uxMessagesWaiting 被 TaskX Give +1 → 回到 1
+     → TaskX 的令牌"传递"给了下一个 Take 者
+```
+
+**你的工程中 `xTasksWaitingToSend` 永远为空——** 所有 Give/Release 来自 ISR，ISR 中不允许阻塞等待，所以等不到空间就直接返回失败，不会挂入 `xTasksWaitingToSend`。
+
+---
+
 ## 4. initial_count=0 的含义
 
 ```c
