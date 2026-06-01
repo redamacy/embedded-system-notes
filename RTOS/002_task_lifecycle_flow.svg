@@ -1,0 +1,133 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1500" height="980" viewBox="0 0 1500 980" role="img" aria-labelledby="title desc">
+  <title id="title">FG14_Receive_Task creation and lifecycle flow</title>
+  <desc id="desc">Static system flow for osThreadNew, dynamic stack and TCB allocation, TCB initialization, ReadyList insertion, semaphore blocking, RAIL wakeup, and task execution.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#44546a"/>
+    </marker>
+    <style>
+      text { font-family: "Microsoft YaHei", "Noto Sans CJK SC", Arial, sans-serif; fill: #1f2937; }
+      .title { font-size: 28px; font-weight: 700; }
+      .subtitle { font-size: 16px; fill: #5b677a; }
+      .node-title { font-size: 18px; font-weight: 700; }
+      .node-body { font-size: 15px; fill: #374151; }
+      .small { font-size: 13px; fill: #5b677a; }
+      .box { fill: #ffffff; stroke: #7c8aa0; stroke-width: 2; rx: 10; }
+      .api { fill: #eef6ff; stroke: #2f80ed; }
+      .mem { fill: #fff6e5; stroke: #c77d1a; }
+      .kernel { fill: #eefcf4; stroke: #2f9e62; }
+      .wait { fill: #fff0f0; stroke: #cf4b4b; }
+      .run { fill: #f2efff; stroke: #7357d8; }
+      .line { stroke: #44546a; stroke-width: 2.2; fill: none; marker-end: url(#arrow); }
+      .dash { stroke-dasharray: 7 6; }
+      .lane { fill: #f8fafc; stroke: #d8dee9; stroke-width: 1.5; rx: 14; }
+    </style>
+  </defs>
+
+  <rect x="0" y="0" width="1500" height="980" fill="#ffffff"/>
+  <text x="60" y="54" class="title">FG14_Receive_Task：从 osThreadNew 到信号量唤醒</text>
+  <text x="60" y="82" class="subtitle">静态 SVG 图，避免 GitHub Mermaid 加载失败；内容对应本工程 FreeRTOS / CMSIS-RTOS2 路径。</text>
+
+  <rect x="45" y="120" width="1410" height="235" class="lane"/>
+  <text x="65" y="148" class="node-title">1. 创建对象：CMSIS 封装到 FreeRTOS 动态创建</text>
+
+  <rect x="70" y="180" width="230" height="105" class="box api"/>
+  <text x="92" y="211" class="node-title">osThreadNew()</text>
+  <text x="92" y="240" class="node-body">func = FG14_Receive_Task</text>
+  <text x="92" y="264" class="node-body">name = "FG14_Receive"</text>
+
+  <rect x="345" y="180" width="260" height="105" class="box api"/>
+  <text x="367" y="211" class="node-title">解析 attr</text>
+  <text x="367" y="240" class="node-body">stack_size = 4096 bytes</text>
+  <text x="367" y="264" class="node-body">priority = 15</text>
+
+  <rect x="650" y="180" width="265" height="105" class="box mem"/>
+  <text x="672" y="211" class="node-title">malloc task stack</text>
+  <text x="672" y="240" class="node-body">usStackDepth = 1024 words</text>
+  <text x="672" y="264" class="node-body">实际 RAM = 4KB</text>
+
+  <rect x="960" y="180" width="220" height="105" class="box mem"/>
+  <text x="982" y="211" class="node-title">malloc TCB_t</text>
+  <text x="982" y="240" class="node-body">任务控制块 RAM</text>
+  <text x="982" y="264" class="node-body">保存调度元数据</text>
+
+  <rect x="1225" y="180" width="200" height="105" class="box mem"/>
+  <text x="1247" y="211" class="node-title">建立关联</text>
+  <text x="1247" y="240" class="node-body">TCB-&gt;pxStack</text>
+  <text x="1247" y="264" class="node-body">指向 4KB stack</text>
+
+  <path d="M300 232 H345" class="line"/>
+  <path d="M605 232 H650" class="line"/>
+  <path d="M915 232 H960" class="line"/>
+  <path d="M1180 232 H1225" class="line"/>
+
+  <rect x="45" y="390" width="1410" height="245" class="lane"/>
+  <text x="65" y="418" class="node-title">2. 初始化 TCB 与初始栈帧：让任务具备被恢复的现场</text>
+
+  <rect x="70" y="455" width="245" height="115" class="box kernel"/>
+  <text x="92" y="486" class="node-title">填充 stack</text>
+  <text x="92" y="515" class="node-body">memset(stack, 0xA5)</text>
+  <text x="92" y="539" class="node-body">用于栈水位检测</text>
+
+  <rect x="360" y="455" width="255" height="115" class="box kernel"/>
+  <text x="382" y="486" class="node-title">计算栈顶并对齐</text>
+  <text x="382" y="515" class="node-body">pxTopOfStack = stack[1023]</text>
+  <text x="382" y="539" class="node-body">按 8 字节向下对齐</text>
+
+  <rect x="660" y="455" width="260" height="115" class="box kernel"/>
+  <text x="682" y="486" class="node-title">初始化 TCB 字段</text>
+  <text x="682" y="515" class="node-body">pcTaskName / uxPriority</text>
+  <text x="682" y="539" class="node-body">xStateListItem / xEventListItem</text>
+
+  <rect x="965" y="455" width="265" height="115" class="box kernel"/>
+  <text x="987" y="486" class="node-title">伪造初始 CPU 现场</text>
+  <text x="987" y="515" class="node-body">R0 = NULL</text>
+  <text x="987" y="539" class="node-body">PC = FG14_Receive_Task</text>
+
+  <rect x="1265" y="455" width="160" height="115" class="box kernel"/>
+  <text x="1287" y="486" class="node-title">保存栈顶</text>
+  <text x="1287" y="515" class="node-body">TCB-&gt;pxTopOfStack</text>
+  <text x="1287" y="539" class="node-body">供切换恢复</text>
+
+  <path d="M315 512 H360" class="line"/>
+  <path d="M615 512 H660" class="line"/>
+  <path d="M920 512 H965" class="line"/>
+  <path d="M1230 512 H1265" class="line"/>
+
+  <rect x="45" y="670" width="1410" height="250" class="lane"/>
+  <text x="65" y="698" class="node-title">3. 进入调度系统：ReadyList、无限期阻塞与 RAIL 唤醒</text>
+
+  <rect x="70" y="735" width="245" height="115" class="box kernel"/>
+  <text x="92" y="766" class="node-title">加入 ReadyList[15]</text>
+  <text x="92" y="795" class="node-body">xStateListItem 入链</text>
+  <text x="92" y="819" class="node-body">uxTopReadyPriority = 15</text>
+
+  <rect x="360" y="735" width="245" height="115" class="box run"/>
+  <text x="382" y="766" class="node-title">Scheduler 启动</text>
+  <text x="382" y="795" class="node-body">SVC 恢复首个任务</text>
+  <text x="382" y="819" class="node-body">进入 FG14_Receive_Task</text>
+
+  <rect x="650" y="735" width="270" height="115" class="box wait"/>
+  <text x="672" y="766" class="node-title">Acquire 失败</text>
+  <text x="672" y="795" class="node-body">Semaphore count = 0</text>
+  <text x="672" y="819" class="node-body">任务进入 BLOCKED</text>
+
+  <rect x="965" y="710" width="280" height="165" class="box wait"/>
+  <text x="987" y="741" class="node-title">无限期等待的链表状态</text>
+  <text x="987" y="770" class="node-body">xEventListItem -&gt; FG14ReceiveSemaphore</text>
+  <text x="987" y="794" class="node-body">xStateListItem -&gt; xSuspendedTaskList</text>
+  <text x="987" y="818" class="small">不是主动 vTaskSuspend()</text>
+  <text x="987" y="842" class="small">而是 portMAX_DELAY 复用该链表</text>
+
+  <rect x="1290" y="735" width="135" height="115" class="box run"/>
+  <text x="1312" y="766" class="node-title">RAIL RX</text>
+  <text x="1312" y="795" class="node-body">Release 信号量</text>
+  <text x="1312" y="819" class="node-body">回到 Ready/Run</text>
+
+  <path d="M315 792 H360" class="line"/>
+  <path d="M605 792 H650" class="line"/>
+  <path d="M920 792 H965" class="line"/>
+  <path d="M1245 792 H1290" class="line"/>
+  <path d="M1358 735 C1365 650 1130 610 880 632 C620 654 220 654 195 735" class="line dash"/>
+  <text x="845" y="635" class="small">xTaskRemoveFromEventList() -&gt; ReadyList[15] -&gt; FG14ReceiveProcess()</text>
+</svg>

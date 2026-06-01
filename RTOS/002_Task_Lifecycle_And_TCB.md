@@ -42,36 +42,21 @@ PendSV 弹出栈帧 → CPU 执行
 
 ### 1.0 系统流图
 
-```mermaid
-flowchart TD
-    A["osThreadNew(FG14_Receive_Task, ...)"] --> B["pvPortMalloc(sizeof(TCB_t))"]
-    B --> C["pvPortMalloc(usStackDepth × 4)"]
-    C --> D["prvInitialiseNewTask(...)"]
-    D --> D1["memset(stack, 0xa5)"]
-    D1 --> D2["pxTopOfStack = &stack[top]"]
-    D2 --> D3["初始化 xStateListItem"]
-    D3 --> D4["初始化 xEventListItem<br/>(xItemValue = 56-prio)"]
-    D4 --> D5["pxPortInitialiseStack()<br/>伪造异常栈帧: PC=Task函数"]
-    D5 --> E["prvAddNewTaskToReadyList(...)"]
-    E --> E1["uxCurrentNumberOfTasks++"]
-    E1 --> E2{"首个Task?"}
-    E2 -->|是| E3["prvInitialiseTaskLists()<br/>初始化全部内核链表"]
-    E2 -->|否| E4["跳过"]
-    E3 --> E5a["prvAddTaskToReadyList"]
-    E4 --> E5a
-    E5a --> E5b["taskRECORD_READY_PRIORITY"]
-    E5b --> E5c["vListInsertEnd(&ReadyList[15], &xStateListItem)"]
-    E5c --> F["Scheduler 启动后<br/>PendSV 选中 → CPU 执行"]
-```
+![FG14_Receive_Task 创建与唤醒系统流图](./002_task_lifecycle_flow.svg)
+
+> 上图使用静态 SVG，避免 GitHub Mermaid 资源加载失败时只显示源码。
 
 ### 1.1 调用链总览
 
 ```
 osThreadNew(FG14_Receive_Task, NULL, &FG14_Receive_attributes)
-  └─ pxNewTCB = pvPortMalloc(sizeof(TCB_t))         ① 分配 TCB
-  └─ pxNewTCB->pxStack = pvPortMalloc(4096)           ② 分配 Stack
+  └─ stack = attr->stack_size / sizeof(StackType_t) = 1024
+  └─ xTaskCreate(..., usStackDepth = 1024, ...)
+       ├─ pxStack = pvPortMalloc(1024 * sizeof(StackType_t)) = 4096 bytes
+       ├─ pxNewTCB = pvPortMalloc(sizeof(TCB_t))
+       └─ pxNewTCB->pxStack = pxStack
   └─ prvInitialiseNewTask(...)                        ③ 初始化 TCB + 伪造栈帧
-       ├─ memset(stack, 0xa5, 4096)                  ③a 栈填充已知值
+       ├─ memset(stack, 0xa5, 4096 bytes)            ③a 栈填充已知值
        ├─ pxTopOfStack = &stack[ulStackDepth - 1]    ③b 计算栈顶
        ├─ pxTopOfStack 8 字节对齐                     ③c
        ├─ 复制 pcTaskName                             ③d
@@ -94,23 +79,18 @@ osThreadNew(FG14_Receive_Task, NULL, &FG14_Receive_attributes)
 
 ### 1.2 逐段展开
 
-#### ① 分配 TCB — 为什么动态分配
+#### ① 分配 Stack + TCB — 为什么动态分配
 
 ```c
-// tasks.c:750, xTaskCreate()
+// tasks.c:786, xTaskCreate() - 向下生长分支
+pxStack = pvPortMalloc(usStackDepth * sizeof(StackType_t));  // 先栈
 pxNewTCB = (TCB_t *) pvPortMalloc(sizeof(TCB_t));
+pxNewTCB->pxStack = pxStack;
 ```
 
 在 FreeRTOS 10.4.3 中，`configSUPPORT_DYNAMIC_ALLOCATION = 1`，所以 `xTaskCreate` 走动态分配路径。`pvPortMalloc` 从 FreeRTOS 自己的 heap_4.c 中分配（本项目 `configTOTAL_HEAP_SIZE = 32768`）。
 
 **注意顺序：** Cortex-M 栈向下生长（`portSTACK_GROWTH < 0`），所以**先分配栈、再分配 TCB**，防止 TCB 被栈溢出踩到：
-
-```c
-// tasks.c:786, xTaskCreate() - 向下生长分支
-pxStack = pvPortMalloc(usStackDepth * sizeof(StackType_t));  // 先栈
-pxNewTCB = (TCB_t *) pvPortMalloc(sizeof(TCB_t));            // 再 TCB
-pxNewTCB->pxStack = pxStack;
-```
 
 #### ② 栈大小 — 字 vs 字节
 
@@ -119,11 +99,19 @@ pxNewTCB->pxStack = pxStack;
 .stack_size = 256 * 16    // = 4096
 ```
 
-`usStackDepth` 的**单位是"字"（StackType_t）**，在 Cortex-M33 上是 4 字节。所以 `256 * 16 = 4096 words = 16384 bytes = 16KB`。
+CMSIS-RTOS2 的 `attr.stack_size` 单位是**字节**，所以这里的 4096 表示 **4096 bytes = 4KB**。
+
+`osThreadNew()` 再把它转换成 FreeRTOS 的 `usStackDepth`：
+
+```c
+stack = attr->stack_size / sizeof(StackType_t);  // 4096 / 4 = 1024
+```
+
+进入 `xTaskCreate()` 后，`usStackDepth` 的单位才是 `StackType_t`。
 
 实际分配：
 ```c
-pvPortMalloc(4096 * sizeof(StackType_t))  // = 4096 × 4 = 16384 bytes
+pvPortMalloc(1024 * sizeof(StackType_t))  // = 1024 × 4 = 4096 bytes = 4KB
 ```
 
 #### ③ 栈顶计算与对齐
@@ -502,7 +490,7 @@ void FG14_Receive_Task(void *argument)
 
 ```
 1. Scheduler 启动 → prvStartFirstTask → SVC → vRestoreContextOfFirstTask
-2. PendSV 退出时弹出 FG14_Receive_Task 的栈帧
+2. 首个任务由 SVC 启动路径恢复；后续任务切换主要由 PendSV 完成
 3. PC = FG14_Receive_Task 入口 → CPU 开始执行 for(;;)
 4. 状态: READY → RUNNING
 ```
@@ -514,7 +502,6 @@ void FG14_Receive_Task(void *argument)
 ```
 osSemaphoreAcquire(sem, portMAX_DELAY)
   → xQueueSemaphoreTake(sem, portMAX_DELAY)
-    → xQueueGenericReceive(sem, NULL, portMAX_DELAY, pdTRUE)
 ```
 
 关键代码路径（queue.c）：
@@ -525,8 +512,7 @@ if (prvIsQueueEmpty(pxQueue) != pdFALSE)
 {
     if (xTicksToWait == 0) { return errQUEUE_EMPTY; }  // 不等待
 
-    // ② 有超时 → 需要把 Task 从 ReadyList 移除
-    //    但 portMAX_DELAY → 不设置超时，不挂 DelayedList
+    // ② 没有令牌 → 需要把 Task 从 ReadyList 移除，并挂入事件等待链表
     vTaskPlaceOnEventList(&pxQueue->xTasksWaitingToReceive, xTicksToWait);
 }
 ```
@@ -540,16 +526,11 @@ void vTaskPlaceOnEventList(List_t *pxEventList, TickType_t xTicksToWait)
     vListInsert(pxEventList, &pxTCB->xEventListItem);
     //    按 xItemValue（优先级逆序）插入 → 高优先级 Task 排在前面
 
-    // ② 把 xStateListItem 从 ReadyList 移除
-    if (uxListRemove(&pxTCB->xStateListItem) == 0) {
-        taskRESET_READY_PRIORITY(pxTCB->uxPriority);
-        // 如果该优先级链表变空了，需要重新查找最高 Ready 优先级
-    }
-
-    // ③ 如果有超时（portMAX_DELAY 没有）→ 把 Task 也挂入 DelayedList
-    if (xTicksToWait != portMAX_DELAY) {
-        vTaskPlaceOnEventListRestricted(&xDelayedTaskList, xTicksToWait);
-    }
+    // ② 把当前任务从 ReadyList 移除
+    // ③ portMAX_DELAY 且 INCLUDE_vTaskSuspend=1：
+    //    xStateListItem 不挂 DelayedList，而是挂 xSuspendedTaskList
+    //    含义是“无限期阻塞，不由 tick 超时唤醒”
+    prvAddCurrentTaskToDelayedList(xTicksToWait, pdTRUE);
 }
 ```
 
@@ -557,7 +538,7 @@ void vTaskPlaceOnEventList(List_t *pxEventList, TickType_t xTicksToWait)
 
 ```
 FG14_Receive_Task:
-  xStateListItem  → [已从 ReadyList 移除] pxContainer = NULL
+  xStateListItem  → xSuspendedTaskList (portMAX_DELAY 无限期阻塞复用该链表)
   xEventListItem  → Semaphore.xTasksWaitingToReceive (按优先级排序)
   Task 状态: BLOCKED
 ```
@@ -570,7 +551,7 @@ FG14_Receive_Task:
 
 #### 阶段 C: Blocked → Ready (信号量被 Give)
 
-当 SPI 中断触发 `osSemaphoreRelease(FG14ReceiveSemaphoreHandle)`：
+当 RAIL 收到完整 RF 包后，`app_process_action()` 释放 `FG14ReceiveSemaphoreHandle`：
 
 ```
 osSemaphoreRelease(sem)
@@ -623,25 +604,26 @@ BaseType_t xTaskRemoveFromEventList(List_t *pxEventList)
 }
 ```
 
-**锁存→解锁后恢复的时序：**
+**RAIL 收包→释放信号量→恢复任务的时序：**
 
 ```
-ISR (优先级 2)
-  spi_gpioCallback()
-    → osSemaphoreRelease(BG22ReceiveSemaphoreHandle)  // FromISR 版本
+RAIL RX callback / app_process_action()
+  → osSemaphoreRelease(FG14ReceiveSemaphoreHandle)
       → xTaskRemoveFromEventList
-        → prvAddTaskToReadyList → BG22_Receive 重新 Ready
-        → 返回 pdTRUE (因为 BG22_Receive 优先级 13 > 当前任务优先级)
+        → 从 Semaphore.xTasksWaitingToReceive 摘除 FG14_Receive.xEventListItem
+        → 从 xSuspendedTaskList 摘除 FG14_Receive.xStateListItem
+        → prvAddTaskToReadyList → FG14_Receive 重新 ReadyList[15]
+        → 返回 pdTRUE (如果 FG14_Receive 优先级高于当前 Running Task)
 
   ↓ PendSV 被触发（ISR 退出时硬件自动尾链）
 PendSV_Handler (最低异常优先级)
   → 保存当前任务上下文 (pxCurrentTCB->pxTopOfStack = PSP)
   → vTaskSwitchContext()
     → taskSELECT_HIGHEST_PRIORITY_TASK()
-       → 扫描 pxReadyTasksLists[] → 选优先级 13 (BG22_Receive)
-       → pxCurrentTCB = BG22_ReceiveHandle
-  → 恢复 BG22_Receive 的上下文 (PSP = pxCurrentTCB->pxTopOfStack)
-  → bx lr → CPU 执行 BG22_Receive_Task 的 for(;;)
+       → 扫描 pxReadyTasksLists[] → 选优先级 15 (FG14_Receive)
+       → pxCurrentTCB = FG14_ReceiveHandle
+  → 恢复 FG14_Receive 的上下文 (PSP = pxCurrentTCB->pxTopOfStack)
+  → bx lr → CPU 执行 FG14_Receive_Task 的 for(;;)
 ```
 
 **此时 TCB 的链表状态：**
@@ -668,6 +650,29 @@ RUNNING ────────────────────────
 从 xStateListItem 在 ReadyList → 不再在 ReadyList → 回到 ReadyList
 
 从 xEventListItem 不在 EventList → 在 Semaphore.xTasksWaitingToReceive → 摘除
+```
+
+### 3.4 与 001 信号量文档的接口
+
+`001_FreeRTOS_Semaphore_Kernel_Deep_Dive_v2.md` 主要从 `Queue_t` 视角解释 Semaphore；本文从 `TCB_t` 视角解释 Task。两个视角在这里接上：
+
+| 视角 | Semaphore 文档关注 | Task 文档关注 |
+|------|-------------------|---------------|
+| 等待发生 | `Queue_t.xTasksWaitingToReceive` 接收一个等待者 | `TCB.xEventListItem` 挂入该等待链表 |
+| 任务不可运行 | 信号量为空，Take 方不能继续 | `TCB.xStateListItem` 从 ReadyList 移走 |
+| 无限期等待 | `portMAX_DELAY` 表示不靠 tick 超时 | 本工程 `INCLUDE_vTaskSuspend=1`，`xStateListItem` 挂入 `xSuspendedTaskList` |
+| 事件到达 | Give/Release 检查等待链表 | `xTaskRemoveFromEventList()` 通过 `pvOwner` 找回 TCB |
+| 恢复运行 | 等待链表摘除 | `xStateListItem` 插回 `ReadyList[15]`，等待 PendSV/Scheduler 选中 |
+
+工程对应关系：
+
+```
+RAIL RX 事件
+  → osSemaphoreRelease(FG14ReceiveSemaphoreHandle)
+  → Queue_t.xTasksWaitingToReceive 找到 FG14_Receive.xEventListItem
+  → xEventListItem.pvOwner 反查 FG14_Receive 的 TCB
+  → xStateListItem 从 xSuspendedTaskList 移回 ReadyList[15]
+  → FG14_Receive_Task 恢复后执行 FG14ReceiveProcess()
 ```
 
 ---
@@ -972,7 +977,7 @@ T2: osSemaphoreAcquire(FG14ReceiveSemaphoreHandle, portMAX_DELAY)
     状态: RUNNING → BLOCKED
     pxCurrentTCB → 切换到下一个 Ready Task
 
-T3: SPI GPIO 中断触发
+T3: RAIL RX 事件触发
     osSemaphoreRelease(FG14ReceiveSemaphoreHandle)
     从 Semaphore.xTasksWaitingToReceive 找到 FG14_Receive.xEventListItem
     xEventListItem: 从 Semaphore 等待链表摘除
@@ -1023,18 +1028,19 @@ apploader_Handle   = osThreadNew(apploader_Task,     NULL, &apploader_attributes
 1. 创建 FG14_Receive(15):  pxCurrentTCB = FG14_Receive (第一个, uxTopReadyPriority=15)
 2. 创建 FG14_Send(14):     pxCurrentTCB 不变 (14 < 15, 不是最高)
 3. 创建 BG22_Receive(13):  pxCurrentTCB 不变 (13 < 15)
-4. 创建 apploader(12):     pxCurrentTCB 不变 (12 < 15)
+4. 创建 apploader(12):     pxCurrentTCB 不变 (12 < 15)，随后 vTaskSuspend(apploader_Handle)
 ```
 
-所有 Task 创建完毕时的 ReadyList：
+`MX_FREERTOS_Init()` 结束、调度器启动前的链表状态：
 
 ```
 pxReadyTasksLists[15]: [FG14_Receive.xStateListItem]
 pxReadyTasksLists[14]: [FG14_Send.xStateListItem]
 pxReadyTasksLists[13]: [BG22_Receive.xStateListItem]
-pxReadyTasksLists[12]: [apploader.xStateListItem]
+pxReadyTasksLists[12]: [空]  ← apploader 已被 vTaskSuspend() 移走
 pxReadyTasksLists[11..1]: [空]
-pxReadyTasksLists[0]: [Idle.xStateListItem]  ← 由 vTaskStartScheduler 创建
+xSuspendedTaskList: [apploader.xStateListItem]
+pxReadyTasksLists[0]: [空]  ← Idle Task 尚未创建，vTaskStartScheduler() 后才出现
 
 uxTopReadyPriority = 15
 pxCurrentTCB = FG14_ReceiveHandle
