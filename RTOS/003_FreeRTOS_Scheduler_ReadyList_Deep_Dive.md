@@ -5,6 +5,14 @@
 
 ---
 
+## 一图速览：本文主线
+
+[![003 Scheduler ReadyList Overview](./003_scheduler_readylist_overview.png)](./003_scheduler_readylist_overview.png)
+
+> 上图是本文的阅读地图：先看 RAIL RX 如何让 `FG14_Receive` 回到 ReadyList，再看 Scheduler 如何把 `pxCurrentTCB` 指向它。点击图片可以在 GitHub 中查看大图。
+
+---
+
 ## 目录
 
 - [模型：Scheduler 只改变 pxCurrentTCB](#模型scheduler-只改变-pxcurrenttcb)
@@ -68,6 +76,29 @@ Scheduler 真正做的事情只有一句话：
 ---
 
 ## §1 工程场景：FG14_Receive 为什么会被选中
+
+### 1.0 Scheduler 总览
+
+本文只研究一条链：
+
+```
+ReadyList -> Scheduler -> pxCurrentTCB -> PendSV
+```
+
+其中 Scheduler 的职责停在 `pxCurrentTCB`：
+
+| 阶段 | 本文关注点 | 是否真正切 CPU |
+|---|---|---|
+| ReadyList | 哪些 Task 已经 Ready | 否 |
+| Scheduler | 从 ReadyList 选出下一个 TCB | 否 |
+| `pxCurrentTCB` | 指向被选中的 TCB | 否 |
+| PendSV | 后续保存/恢复上下文 | 是 |
+
+所以后面看到“触发调度”“抢占”“时间片轮转”时，先不要理解成“寄存器已经切了”。在本文里，它们的核心结果都是：
+
+```
+pxCurrentTCB 指向谁
+```
 
 ### 1.1 从真实收包路径进入
 
@@ -372,6 +403,21 @@ priority 15 -> pxReadyTasksLists[15]
 priority 55 -> pxReadyTasksLists[55]
 ```
 
+Scheduler 选择时看到的是“空/非空”的优先级桶：
+
+```mermaid
+flowchart TD
+    A["uxTopReadyPriority = 15"] --> B{"ReadyList[15]<br/>非空?"}
+    B -- "是：FG14_Receive Ready" --> C["选择 ReadyList[15]<br/>listGET_OWNER_OF_NEXT_ENTRY()"]
+    C --> D["pxCurrentTCB = FG14_Receive TCB"]
+
+    B -- "否" --> E{"ReadyList[14]<br/>非空?"}
+    E -- "是：FG14_Send Ready" --> F["选择 ReadyList[14]"]
+    E -- "否" --> G{"ReadyList[13]<br/>非空?"}
+    G -- "是：BG22_Receive Ready" --> H["选择 ReadyList[13]"]
+    G -- "否" --> I["继续向低优先级扫描<br/>直到 ReadyList[0] Idle"]
+```
+
 这就像按优先级提前分好桶：
 
 ```
@@ -598,6 +644,14 @@ uxTopReadyPriority: 14 -> 15
 2. 如果这个优先级的 ReadyList 是空的，就向低优先级递减。
 3. 找到最高非空 ReadyList 后，从里面取下一个 TCB，让 `pxCurrentTCB` 指向它。
 
+这一节涉及的三个对象可以压成一张表：
+
+| 对象 | 在 Scheduler 路径里的作用 | 本工程例子 |
+|---|---|---|
+| `pxReadyTasksLists[]` | 保存所有 Ready Task 的候选池 | `FG14_Receive` 回到 `ReadyList[15]` |
+| `taskSELECT_HIGHEST_PRIORITY_TASK()` | 找到最高非空 ReadyList，并取出下一个 owner | 从 `ReadyList[15]` 取出 `FG14_Receive TCB` |
+| `pxCurrentTCB` | 保存 Scheduler 的选择结果 | `pxCurrentTCB = FG14_Receive TCB` |
+
 展开成更直白的伪代码：
 
 ```c
@@ -813,6 +867,8 @@ EventList -> ReadyList
 返回是否需要切换
 ```
 
+也就是说，这里只是把“需要调度”这件事标记出来，并把 Task 放回候选池；它仍然没有执行上下文切换。
+
 但它没有：
 
 ```
@@ -986,14 +1042,16 @@ listGET_OWNER_OF_NEXT_ENTRY(pxCurrentTCB, &pxReadyTasksLists[15]);
 
 ```mermaid
 flowchart TD
-    A["ReadyList[15]<br/>TaskA + TaskB"] --> B["Tick"]
+    A["ReadyList[15]<br/>TaskA -> TaskB"] --> B["Tick1<br/>当前 TaskA"]
     B --> C{"ReadyList[15] 长度 > 1?"}
     C -- "Yes" --> D["xSwitchRequired = pdTRUE"]
     D --> E["vTaskSwitchContext()"]
-    E --> F["listGET_OWNER_OF_NEXT_ENTRY()"]
+    E --> F["listGET_OWNER_OF_NEXT_ENTRY()<br/>pxIndex 前进"]
     F --> G["pxCurrentTCB: TaskA -> TaskB"]
-    G --> H["下一次 Tick"]
-    H --> I["pxCurrentTCB: TaskB -> TaskA"]
+    G --> H["Tick2<br/>当前 TaskB"]
+    H --> I["再次触发同级轮转"]
+    I --> J["pxCurrentTCB: TaskB -> TaskA"]
+    J --> B
 ```
 
 再强调一遍：
@@ -1430,12 +1488,21 @@ Scheduler suspended 时，不直接改动 Ready/Delayed 主链表的敏感路径
 
 ```mermaid
 flowchart TD
-    A["Event<br/>RAIL RX / Tick / Yield / Block / Resume"] --> B["Ready<br/>Task 进入或离开 ReadyList"]
-    B --> C["Scheduler<br/>vTaskSwitchContext()"]
-    C --> D["taskSELECT_HIGHEST_PRIORITY_TASK()"]
-    D --> E["pxCurrentTCB<br/>指向被选中的 TCB"]
-    E --> F["PendSV<br/>保存旧上下文 / 恢复新上下文"]
-    F --> G["CPU<br/>继续执行新 Task"]
+    A["Event<br/>RAIL RX / Tick / Yield / Block / Resume"] --> B["ReadyList 变化<br/>Task 进入或离开候选池"]
+    B --> C{"调度原因"}
+
+    C -- "高优先级 Task 变 Ready<br/>15 > 14" --> D["抢占路径<br/>xYieldPending = pdTRUE"]
+    C -- "同优先级 Ready Task > 1<br/>Tick 到来" --> E["轮转路径<br/>xSwitchRequired = pdTRUE"]
+    C -- "当前 Task Block/Yield/Create/Resume" --> F["普通重新选择路径"]
+
+    D --> G["Scheduler<br/>vTaskSwitchContext()"]
+    E --> G
+    F --> G
+
+    G --> H["taskSELECT_HIGHEST_PRIORITY_TASK()"]
+    H --> I["pxCurrentTCB<br/>只更新 TCB 指针"]
+    I --> J["PendSV<br/>保存旧上下文 / 恢复新上下文"]
+    J --> K["CPU<br/>继续执行新 Task"]
 ```
 
 这张图是本文的最终模型。
@@ -1595,6 +1662,8 @@ Idle priority = 0
 | 切 PSP 吗 | 否 | 是 |
 | 决定下一个运行谁吗 | 是 | 否，它服从 `pxCurrentTCB` |
 | 属于 C 层调度逻辑吗 | 是 | 主要是 port/汇编层 |
+
+> 下一篇中的 SysTick / DelayedList 会回答“Blocked Task 怎样回到 ReadyList”；第 005 篇会继续深入 PendSV 如何根据 `pxCurrentTCB` 保存旧上下文、恢复新上下文。
 
 最终模型：
 
