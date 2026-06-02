@@ -362,9 +362,75 @@ TCB_t
 Task 的运行现场与调度元数据
 ```
 
-### 2.2 List_t 的关键字段
+### 2.2 pxReadyTasksLists[] 与内核状态链表都是 List_t
 
-FreeRTOS 的链表头是 `List_t`：
+`pxReadyTasksLists[]` 不是一个普通数组，它是“56 个 `List_t` 链表头”的数组：
+
+```c
+// tasks.c:357
+PRIVILEGED_DATA static List_t pxReadyTasksLists[ configMAX_PRIORITIES ];
+```
+
+这些链表是在第一次创建 Task 时，由 `prvInitialiseTaskLists()` 统一初始化的：
+
+```c
+// tasks.c:3680
+static void prvInitialiseTaskLists( void )
+{
+    UBaseType_t uxPriority;
+
+    for( uxPriority = ( UBaseType_t ) 0U; uxPriority < ( UBaseType_t ) configMAX_PRIORITIES; uxPriority++ )
+    {
+        vListInitialise( &( pxReadyTasksLists[ uxPriority ] ) );
+    }
+
+    vListInitialise( &xDelayedTaskList1 );
+    vListInitialise( &xDelayedTaskList2 );
+    vListInitialise( &xPendingReadyList );
+
+    #if ( INCLUDE_vTaskDelete == 1 )
+        {
+            vListInitialise( &xTasksWaitingTermination );
+        }
+    #endif
+
+    #if ( INCLUDE_vTaskSuspend == 1 )
+        {
+            vListInitialise( &xSuspendedTaskList );
+        }
+    #endif
+
+    pxDelayedTaskList = &xDelayedTaskList1;
+    pxOverflowDelayedTaskList = &xDelayedTaskList2;
+}
+```
+
+所以这里要看的不是“FreeRTOS 有一个叫 `List_t` 的抽象链表类型”这么泛泛的一句话，而是：
+
+```
+pxReadyTasksLists[0]   是一个 List_t
+pxReadyTasksLists[1]   是一个 List_t
+...
+pxReadyTasksLists[55]  是一个 List_t
+
+xDelayedTaskList1      是一个 List_t
+xDelayedTaskList2      是一个 List_t
+xPendingReadyList      是一个 List_t
+xTasksWaitingTermination 是一个 List_t
+xSuspendedTaskList     是一个 List_t
+```
+
+区别只在于“这些 `List_t` 被内核拿来表示什么状态”：
+
+| 链表 | 类型 | 表示的 Task 状态 |
+|---|---|---|
+| `pxReadyTasksLists[priority]` | `List_t` | Ready，按优先级分桶 |
+| `xDelayedTaskList1/2` | `List_t` | Blocked/Delayed，按唤醒 tick 排序 |
+| `xPendingReadyList` | `List_t` | 调度器 suspended 时暂存的待 Ready 任务 |
+| `xTasksWaitingTermination` | `List_t` | 等 Idle Task 回收的已删除任务 |
+| `xSuspendedTaskList` | `List_t` | Suspended，或 `portMAX_DELAY` 下的无限期等待任务 |
+
+每个 `List_t` 链表头内部长这样：
 
 ```c
 // list.h:179
