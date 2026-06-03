@@ -96,7 +96,43 @@ void vTaskStartScheduler( void )
     BaseType_t xReturn;
 
     /* Add the idle task at the lowest priority. */
-    ...
+    #if ( configSUPPORT_STATIC_ALLOCATION == 1 )
+    {
+        StaticTask_t * pxIdleTaskTCBBuffer = NULL;
+        StackType_t * pxIdleTaskStackBuffer = NULL;
+        uint32_t ulIdleTaskStackSize;
+
+        vApplicationGetIdleTaskMemory(
+            &pxIdleTaskTCBBuffer,
+            &pxIdleTaskStackBuffer,
+            &ulIdleTaskStackSize );
+
+        /* 用静态 API 创建 Idle Task：
+         * priority = 0(tskIDLE_PRIORITY)
+         * entry    = prvIdleTask
+         */
+        xIdleTaskHandle = xTaskCreateStatic(
+            prvIdleTask,
+            configIDLE_TASK_NAME,
+            ulIdleTaskStackSize,
+            ( void * ) NULL,
+            portPRIVILEGE_BIT,
+            pxIdleTaskStackBuffer,
+            pxIdleTaskTCBBuffer );
+
+        xReturn = ( xIdleTaskHandle != NULL ) ? pdPASS : pdFAIL;
+    }
+    #else
+    {
+        xReturn = xTaskCreate(
+            prvIdleTask,
+            configIDLE_TASK_NAME,
+            configMINIMAL_STACK_SIZE,
+            ( void * ) NULL,
+            portPRIVILEGE_BIT,
+            &xIdleTaskHandle );
+    }
+    #endif
 
     #if ( configUSE_TIMERS == 1 )
     {
@@ -142,6 +178,8 @@ flowchart TD
     I --> J["xPortStartScheduler()"]
     J --> K["首次进入由 pxCurrentTCB 指向的 Task"]
 ```
+
+图 2 只是把上面的启动顺序压缩成流程：先保证 Idle Task 创建成功，再按配置创建 Timer Service Task，最后才关闭中断、初始化调度器全局变量并进入 port 层启动第一次任务恢复。
 
 注意：`vTaskStartScheduler()` 本身不是“选 Task 的算法”。它主要负责把内核运行环境准备好，然后把第一次上下文恢复交给 port 层。
 
