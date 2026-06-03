@@ -11,11 +11,32 @@
 
 ```mermaid
 flowchart TD
-    A["ReadyList<br/>pxReadyTasksLists[priority]"] --> B["Scheduler<br/>vTaskSwitchContext()"]
+    subgraph REQ["Scheduler 请求来源"]
+        R1["Task Create<br/>新 Task 进入 ReadyList"]
+        R2["taskYIELD()<br/>当前 Task 主动让出"]
+        R3["Task Block<br/>当前 Task 不再可运行"]
+        R4["Wake / Resume<br/>等待 Task 回到 Ready"]
+        R5["Priority / Suspend / Delete<br/>可运行集合或优先级变化"]
+        R6["xTaskResumeAll()<br/>处理 pending ready"]
+        R7["Tick<br/>到期唤醒 / 时间片<br/>细节见 004"]
+    end
+
+    R1 --> Q["调度请求<br/>当前 pxCurrentTCB 可能不再最合适"]
+    R2 --> Q
+    R3 --> Q
+    R4 --> Q
+    R5 --> Q
+    R6 --> Q
+    R7 --> Q
+
+    Q --> B["Scheduler<br/>vTaskSwitchContext()"]
+    A["ReadyList<br/>pxReadyTasksLists[priority]<br/>候选池 / 输入数据"] --> B
     B --> C["pxCurrentTCB<br/>指向下一个 TCB"]
     C --> D["PendSV<br/>后续上下文切换"]
     D --> E["CPU<br/>运行被恢复的 Task"]
 ```
+
+图中要注意：左侧事件是“请求 Scheduler 重新判断”的来源；`ReadyList` 是 Scheduler 选择 TCB 时读取的候选池，不是唯一触发来源。
 
 核心结论：
 
