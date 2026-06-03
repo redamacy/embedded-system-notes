@@ -7,7 +7,7 @@
 
 ## 总览：Scheduler 只选择 TCB
 
-本文只研究 Scheduler 核心路径：
+本文先汇总 Scheduler 被请求执行的来源，再研究 Scheduler 核心选择路径：
 
 ```mermaid
 flowchart TD
@@ -29,7 +29,9 @@ Scheduler 只决定 pxCurrentTCB 应该指向哪个 TCB
 本文聚焦：
 
 ```
-Scheduler 启动
+Scheduler 请求来源
+  -> Create / Yield / Block / Wake / Resume / Priority / Suspend / Tick
+  -> Scheduler 启动
   -> Task 回 ReadyList
   -> ReadyList 按优先级组织
   -> taskSELECT_HIGHEST_PRIORITY_TASK()
@@ -49,10 +51,11 @@ Scheduler 启动
 - [§2 工程场景：FG14_Receive_Task 被选中](#2-工程场景fg14_receive_task-被选中)
 - [§3 ReadyList 数据结构](#3-readylist-数据结构)
 - [§4 Task 如何进入 ReadyList](#4-task-如何进入-readylist)
-- [§5 Scheduler 核心选择](#5-scheduler-核心选择)
-- [§6 抢占逻辑](#6-抢占逻辑)
-- [§7 Idle Task](#7-idle-task)
-- [§8 Scheduler 与 PendSV 边界](#8-scheduler-与-pendsv-边界)
+- [§5 Scheduler 什么时候会被请求执行？](#5-scheduler-什么时候会被请求执行)
+- [§6 Scheduler 核心选择](#6-scheduler-核心选择)
+- [§7 抢占逻辑](#7-抢占逻辑)
+- [§8 Idle Task](#8-idle-task)
+- [§9 Scheduler 与 PendSV 边界](#9-scheduler-与-pendsv-边界)
 - [Appendix A：关键函数速查](#appendix-a关键函数速查)
 - [Appendix B：工程 Task 优先级表](#appendix-b工程-task-优先级表)
 - [Appendix C：Scheduler 与 PendSV 边界对照表](#appendix-cscheduler-与-pendsv-边界对照表)
@@ -700,9 +703,550 @@ flowchart TD
 
 ---
 
-## §5 Scheduler 核心选择
+## §5 Scheduler 什么时候会被请求执行？
 
-### 5.1 vTaskSwitchContext() 做什么
+### 5.1 核心模型
+
+Scheduler 不是只有 ReadyList 改变时才会触发。
+
+更准确的判断条件是：
+
+```text
+内核认为当前 pxCurrentTCB 可能不再是最合适继续运行的 Task
+  -> 请求 Scheduler 重新判断
+```
+
+Scheduler 的边界仍然不变：
+
+```text
+输入：ReadyList / uxTopReadyPriority / 当前任务状态
+输出：新的 pxCurrentTCB
+
+不做：保存寄存器
+不做：恢复寄存器
+不做：切 PSP
+不做：真正让 CPU 跑到另一个 Task
+```
+
+一次调度请求可以压成这样：
+
+```text
+某个内核事件发生
+  -> 当前 Task 状态、ReadyList、优先级或 pending yield 发生变化
+  -> 内核请求 yield / PendSV
+  -> vTaskSwitchContext()
+  -> taskSELECT_HIGHEST_PRIORITY_TASK()
+  -> pxCurrentTCB 更新
+  -> 后续 PendSV 负责上下文切换
+```
+
+所以 003 这一节先回答：
+
+```text
+哪些事件会让内核认为“需要重新选一次 TCB”？
+```
+
+下一节再继续讲 `vTaskSwitchContext()` 里具体怎么选。
+
+### 5.2 Task 创建后进入 ReadyList
+
+典型调用链：
+
+```text
+osThreadNew()
+  -> xTaskCreate()
+  -> prvInitialiseNewTask()
+  -> prvAddNewTaskToReadyList()
+  -> prvAddTaskToReadyList()
+```
+
+`prvAddNewTaskToReadyList()` 先把新 Task 插入 ReadyList：
+
+```c
+prvAddTaskToReadyList( pxNewTCB );
+```
+
+如果 Scheduler 已经运行，则继续判断：
+
+```c
+if( xSchedulerRunning != pdFALSE )
+{
+    if( pxCurrentTCB->uxPriority < pxNewTCB->uxPriority )
+    {
+        taskYIELD_IF_USING_PREEMPTION();
+    }
+}
+```
+
+含义是：
+
+```text
+新 Task 已经 Ready
+  -> 如果新 Task 优先级高于当前 Running Task
+  -> 当前 pxCurrentTCB 可能不再合适
+  -> 请求重新调度
+```
+
+在调度器启动前创建 Task 时，内核只是维护 `pxCurrentTCB` 指向目前最高优先级 Task；调度器启动后再创建高优先级 Task，才可能立即请求 yield。
+
+### 5.3 当前 Task 主动 yield
+
+调用：
+
+```c
+taskYIELD();
+```
+
+在 Cortex-M port 中，最终是：
+
+```c
+#define taskYIELD() portYIELD()
+```
+
+`portYIELD()` 会请求 PendSV：
+
+```c
+void vPortYield(void)
+{
+    portNVIC_INT_CTRL_REG = portNVIC_PENDSVSET_BIT;
+    __asm volatile ( "dsb" ::: "memory" );
+    __asm volatile ( "isb" );
+}
+```
+
+这里有一个很重要的点：
+
+```text
+ReadyList 内容不一定变化，也可能触发 Scheduler。
+```
+
+例如同优先级 ReadyList 中有两个 Task：
+
+```text
+ReadyList[14]:
+  TaskA.xStateListItem
+  TaskB.xStateListItem
+```
+
+TaskA 主动 `taskYIELD()`：
+
+```text
+TaskA Running
+  -> taskYIELD()
+  -> PendSV pending
+  -> Scheduler 重新进入 ReadyList[14]
+  -> listGET_OWNER_OF_NEXT_ENTRY()
+  -> pxIndex 向后移动
+  -> 可能选中 TaskB
+```
+
+这时 ReadyList 里还是 TaskA 和 TaskB。
+
+变化的是：
+
+```text
+ReadyList[14].pxIndex
+```
+
+所以 Scheduler 请求不等于 ReadyList 内容一定改变。
+
+### 5.4 当前 Task 阻塞
+
+当前 Running Task 一旦阻塞，它就不能继续运行。
+
+典型入口：
+
+```text
+osSemaphoreAcquire()
+xQueueReceive()
+ulTaskNotifyTake()
+vTaskDelay()
+osDelay()
+```
+
+在 003 中不展开 `vTaskDelay()` 的 DelayedList 细节；那已经放到 004。
+
+这里只抓 Scheduler 视角：
+
+```text
+当前 Running Task 离开 Ready 状态
+  -> pxCurrentTCB 指向的 Task 已经不能继续运行
+  -> 必须重新选择一个 Ready Task
+```
+
+结合本工程：
+
+```text
+FG14_Receive_Task
+  -> osSemaphoreAcquire(FG14ReceiveSemaphoreHandle, portMAX_DELAY)
+  -> 信号量为空
+  -> FG14_Receive_Task 进入阻塞等待
+  -> FG14_Receive_Task 不再在 ReadyList[15] 中可运行
+  -> Scheduler 需要选择其他 Ready Task
+```
+
+ASCII 主线：
+
+```text
+FG14_Receive_Task Running
+  -> osSemaphoreAcquire()
+  -> 没有信号量
+  -> 当前 Task Blocked
+  -> ReadyList[15] 不再有 FG14_Receive
+  -> Scheduler 重新选择
+  -> 可能运行 FG14_Send / BG22_Receive / Idle
+```
+
+这里触发 Scheduler 的原因不是“有更高优先级 Task 出现”，而是：
+
+```text
+当前 Task 自己不能继续运行。
+```
+
+### 5.5 ISR 或其他 Task 唤醒等待任务
+
+这就是本文工程主线。
+
+工程场景：
+
+```text
+RAIL RX
+  -> app_process_action()
+  -> osSemaphoreRelease(FG14ReceiveSemaphoreHandle)
+  -> xTaskRemoveFromEventList()
+  -> FG14_Receive_Task 回 ReadyList[15]
+```
+
+FreeRTOS 里事件唤醒的关键判断：
+
+```c
+if( pxUnblockedTCB->uxPriority > pxCurrentTCB->uxPriority )
+{
+    xReturn = pdTRUE;
+    xYieldPending = pdTRUE;
+}
+```
+
+含义：
+
+```text
+被唤醒 Task 回 ReadyList
+  -> 如果它优先级高于当前 Running Task
+  -> 当前 pxCurrentTCB 可能不再合适
+  -> xYieldPending = pdTRUE
+  -> 请求后续调度
+```
+
+本工程中：
+
+```text
+FG14_Receive_Task priority = 15
+FG14_Send_Task    priority = 14
+BG22_Receive_Task priority = 13
+Idle Task         priority = 0
+```
+
+所以如果当前运行的是 `FG14_Send_Task`，RAIL RX 唤醒 `FG14_Receive_Task` 后：
+
+```text
+15 > 14
+  -> xYieldPending = pdTRUE
+  -> Scheduler 后续会重新选
+  -> pxCurrentTCB 指向 FG14_Receive_TCB
+```
+
+注意：
+
+```text
+被唤醒 Task 回 ReadyList
+不代表一定马上切换。
+```
+
+如果被唤醒任务优先级不高于当前任务，它只是进入 ReadyList 等待后续调度点。
+
+### 5.6 Task Resume
+
+典型 API：
+
+```text
+vTaskResume()
+xTaskResumeFromISR()
+```
+
+`vTaskResume()` 的核心动作：
+
+```c
+uxListRemove( &( pxTCB->xStateListItem ) );
+prvAddTaskToReadyList( pxTCB );
+
+if( pxTCB->uxPriority >= pxCurrentTCB->uxPriority )
+{
+    taskYIELD_IF_USING_PREEMPTION();
+}
+```
+
+也就是：
+
+```text
+Suspended Task
+  -> 从 SuspendedList 移除
+  -> 插入 ReadyList[priority]
+  -> 如果优先级足够高
+  -> 请求重新调度
+```
+
+`xTaskResumeFromISR()` 类似，但 ISR 路径会设置：
+
+```c
+xYieldRequired = pdTRUE;
+xYieldPending = pdTRUE;
+```
+
+Scheduler 视角仍然一样：
+
+```text
+有一个之前不可运行的 Task 重新变成 Ready
+  -> 最高优先级 Ready Task 可能变化
+  -> 需要重新判断 pxCurrentTCB
+```
+
+### 5.7 Task Priority Change
+
+典型 API：
+
+```c
+vTaskPrioritySet(xTask, uxNewPriority);
+```
+
+这个函数不只是改一个数字。
+
+如果被修改的 Task 在 ReadyList 中，内核会把它从旧优先级链表移走，再插入新优先级链表：
+
+```c
+uxPriorityUsedOnEntry = pxTCB->uxPriority;
+pxTCB->uxPriority = uxNewPriority;
+
+if( listIS_CONTAINED_WITHIN(
+        &( pxReadyTasksLists[ uxPriorityUsedOnEntry ] ),
+        &( pxTCB->xStateListItem ) ) != pdFALSE )
+{
+    uxListRemove( &( pxTCB->xStateListItem ) );
+    prvAddTaskToReadyList( pxTCB );
+}
+```
+
+调度请求发生在两类情况：
+
+```text
+1. 提高另一个 Ready Task 的优先级
+   -> 它可能超过当前 Task
+
+2. 降低当前 Running Task 的优先级
+   -> 其他 Ready Task 可能变成更合适
+```
+
+例子：
+
+```text
+当前 Running Task priority = 14
+另一个 Ready Task priority = 13
+
+vTaskPrioritySet(另一个 Task, 15)
+  -> ReadyList[13] 移除
+  -> ReadyList[15] 插入
+  -> 15 >= 当前 14
+  -> 请求调度
+```
+
+所以 Priority Change 触发 Scheduler 的本质是：
+
+```text
+ReadyList 的优先级分布变了。
+```
+
+### 5.8 当前 Task Suspend / Delete
+
+如果当前 Running Task 被挂起或删除，它已经不再可运行。
+
+典型 API：
+
+```text
+vTaskSuspend(NULL)
+vTaskDelete(NULL)
+```
+
+`vTaskSuspend(NULL)` 路径：
+
+```c
+uxListRemove( &( pxTCB->xStateListItem ) );
+vListInsertEnd( &xSuspendedTaskList, &( pxTCB->xStateListItem ) );
+
+if( pxTCB == pxCurrentTCB )
+{
+    portYIELD_WITHIN_API();
+}
+```
+
+`vTaskDelete(NULL)` 路径：
+
+```c
+uxListRemove( &( pxTCB->xStateListItem ) );
+
+if( pxTCB == pxCurrentTCB )
+{
+    vListInsertEnd( &xTasksWaitingTermination,
+                    &( pxTCB->xStateListItem ) );
+    portYIELD_WITHIN_API();
+}
+```
+
+Scheduler 视角：
+
+```text
+pxCurrentTCB 指向的 Task
+  -> 被移出 Ready 状态
+  -> 当前 Task 不能继续运行
+  -> 必须重新选择下一个 Ready Task
+```
+
+这类场景通常一定会切到别的 Task，因为当前 Task 已经主动退出可运行集合。
+
+### 5.9 Scheduler Suspended 后恢复
+
+本工程大量使用：
+
+```text
+vTaskSuspendAll()
+xTaskResumeAll()
+```
+
+例如 `BSP/RF_Timed.c` 中发送 RF 包时：
+
+```c
+vTaskSuspendAll();
+SendToBase(...);
+if(!xTaskResumeAll())
+{
+    taskYIELD();
+}
+```
+
+`vTaskSuspendAll()` 不是关中断。
+
+它的含义是：
+
+```text
+暂停任务调度
+  -> 不允许立刻切 Task
+  -> 但 ISR 仍然可以发生
+  -> ISR 仍可能唤醒 Task
+```
+
+如果调度器挂起期间有 Task 被唤醒，内核不能立刻改 ReadyList 的运行状态，就会先放到：
+
+```text
+xPendingReadyList
+```
+
+`xTaskResumeAll()` 恢复时会统一处理：
+
+```c
+while( listLIST_IS_EMPTY( &xPendingReadyList ) == pdFALSE )
+{
+    pxTCB = listGET_OWNER_OF_HEAD_ENTRY( &xPendingReadyList );
+    uxListRemove( &( pxTCB->xEventListItem ) );
+    uxListRemove( &( pxTCB->xStateListItem ) );
+    prvAddTaskToReadyList( pxTCB );
+
+    if( pxTCB->uxPriority >= pxCurrentTCB->uxPriority )
+    {
+        xYieldPending = pdTRUE;
+    }
+}
+
+if( xYieldPending != pdFALSE )
+{
+    taskYIELD_IF_USING_PREEMPTION();
+}
+```
+
+工程视角：
+
+```text
+FG14_Send_Task
+  -> vTaskSuspendAll()
+  -> SendToBase()
+  -> 期间 RAIL RX / Timer / GPIO ISR 仍可能发生
+  -> 有任务被唤醒但暂存 pending
+  -> xTaskResumeAll()
+  -> pending task 回 ReadyList
+  -> 如果优先级更高，立即请求调度
+```
+
+### 5.10 Tick 触发调度：这里只占位
+
+Tick 也可能请求 Scheduler。
+
+主要有两类：
+
+```text
+1. DelayedList 中 Task 到期
+   -> Task 回 ReadyList
+   -> 可能需要抢占当前 Task
+
+2. 同优先级 Ready Task 时间片轮转
+   -> ReadyList 内容不一定变化
+   -> 但需要重新取下一个 owner
+```
+
+这两类属于：
+
+```text
+时间如何进入调度器
+```
+
+已经放到 004：
+
+```text
+004_FreeRTOS_Tick_DelayedList_TimeSlicing_Deep_Dive.md
+```
+
+003 只保留边界：
+
+```text
+Tick 可以请求 Scheduler
+但 Tick 细节不在本文展开
+```
+
+### 5.11 小结表
+
+| 触发来源 | ReadyList 是否一定改变 | 是否一定切换 Task | 说明 |
+|---|---:|---:|---|
+| Task Create | 可能 | 不一定 | 新任务优先级更高才可能切 |
+| `taskYIELD` | 不一定 | 不一定 | 同优先级轮转时可能切 |
+| Task Block | 通常会 | 通常会 | 当前任务不能继续运行 |
+| Semaphore/Queue Wake | 通常会 | 不一定 | 唤醒任务优先级更高才抢占 |
+| Resume | 通常会 | 不一定 | 被恢复任务进入 ReadyList |
+| Priority Change | 可能 | 可能 | 最高 Ready 优先级可能变化 |
+| Suspend/Delete 当前任务 | 会 | 通常会 | 当前任务不再可运行 |
+| `xTaskResumeAll` | 可能 | 可能 | 处理 pending ready |
+| Tick | 可能 | 可能 | 细节放到 004 |
+
+这一节的结论是：
+
+```text
+Scheduler 的触发来源很多。
+ReadyList 改变只是其中一类。
+
+只要内核认为当前 pxCurrentTCB 可能不再是最合适的 Task，
+就会请求 Scheduler 重新判断。
+```
+
+---
+
+## §6 Scheduler 核心选择
+
+### 6.1 vTaskSwitchContext() 做什么
 
 `vTaskSwitchContext()` 是 Scheduler 选择 TCB 的核心入口：
 
@@ -764,7 +1308,7 @@ void vTaskSwitchContext(void)
 
 这些属于 PendSV。
 
-### 5.2 taskSELECT_HIGHEST_PRIORITY_TASK()
+### 6.2 taskSELECT_HIGHEST_PRIORITY_TASK()
 
 本工程使用通用 C 版本：
 
@@ -805,7 +1349,7 @@ listGET_OWNER_OF_NEXT_ENTRY()
 pxCurrentTCB = FG14_Receive TCB
 ```
 
-### 5.3 uxTopReadyPriority 扫描 ReadyList
+### 6.3 uxTopReadyPriority 扫描 ReadyList
 
 扫描示意：
 
@@ -829,7 +1373,7 @@ BG22_Receive priority = 13
 Idle         priority = 0
 ```
 
-### 5.4 同优先级轮转逻辑（不涉及 Tick）
+### 6.4 同优先级轮转逻辑（不涉及 Tick）
 
 `taskSELECT_HIGHEST_PRIORITY_TASK()` 最后调用：
 
@@ -878,11 +1422,11 @@ Scheduler 每次需要从 ReadyList[15] 重新选择时：
 
 这里讲的是“取下一个 TCB 的机制”。至于什么时候触发这次重新选择，本文不展开；Tick 驱动同优先级时间片的触发条件放到下一篇。
 
-### 5.5 Scheduler 选择图
+### 6.5 Scheduler 选择图
 
 ```mermaid
 flowchart TD
-    A["ReadyList 发生变化<br/>或已有 pending yield"] --> B["vTaskSwitchContext()"]
+    A["调度请求发生<br/>ReadyList 变化 / pending yield / 当前 Task 不可运行"] --> B["vTaskSwitchContext()"]
     B --> C["taskSELECT_HIGHEST_PRIORITY_TASK()"]
     C --> D["uxTopReadyPriority<br/>找到最高非空 ReadyList"]
     D --> E["listGET_OWNER_OF_NEXT_ENTRY()"]
@@ -892,9 +1436,9 @@ flowchart TD
 
 ---
 
-## §6 抢占逻辑
+## §7 抢占逻辑
 
-### 6.1 本工程开启抢占
+### 7.1 本工程开启抢占
 
 ```c
 // config/FreeRTOSConfig.h
@@ -926,7 +1470,7 @@ if( pxUnblockedTCB->uxPriority > pxCurrentTCB->uxPriority )
 }
 ```
 
-### 6.2 抢占不是上下文切换本身
+### 7.2 抢占不是上下文切换本身
 
 这里的“抢占”先表现为：
 
@@ -945,7 +1489,7 @@ pxCurrentTCB = FG14_Receive TCB
 
 真正保存旧 Task 上下文、恢复新 Task 上下文，是 PendSV 负责。
 
-### 6.3 Idle Task 作为兜底
+### 7.3 Idle Task 作为兜底
 
 如果所有业务 Task 都不 Ready：
 
@@ -967,9 +1511,9 @@ ReadyList[0] -> Idle Task
 
 ---
 
-## §7 Idle Task
+## §8 Idle Task
 
-### 7.1 Idle Task 的创建
+### 8.1 Idle Task 的创建
 
 Idle Task 由 `vTaskStartScheduler()` 自动创建：
 
@@ -1014,7 +1558,7 @@ static portTASK_FUNCTION( prvIdleTask, pvParameters )
 }
 ```
 
-### 7.2 Idle Task 的职责
+### 8.2 Idle Task 的职责
 
 Idle Task 至少有三个工程意义：
 
@@ -1037,13 +1581,13 @@ flowchart TD
 
 ---
 
-## §8 Scheduler 与 PendSV 边界
+## §9 Scheduler 与 PendSV 边界
 
-### 8.1 总边界图
+### 9.1 总边界图
 
 ```mermaid
 flowchart TD
-    A["ReadyList 变化<br/>Task Create / Unblock / Resume / Block"] --> B["Scheduler<br/>vTaskSwitchContext()"]
+    A["调度请求<br/>Create / Yield / Block / Wake / Resume / Priority / Suspend / Tick"] --> B["Scheduler<br/>vTaskSwitchContext()"]
     B --> C["taskSELECT_HIGHEST_PRIORITY_TASK()"]
     C --> D["pxCurrentTCB<br/>指向选中的 TCB"]
     D --> E["PendSV<br/>保存旧上下文 / 恢复新上下文"]
@@ -1064,7 +1608,7 @@ pxCurrentTCB
 
 这就是二者的接口。
 
-### 8.2 职责对比
+### 9.2 职责对比
 
 | 问题 | Scheduler | PendSV |
 |---|---|---|
@@ -1087,7 +1631,7 @@ vTaskSwitchContext() 更新 pxCurrentTCB
 PendSV 根据 pxCurrentTCB 完成上下文切换
 ```
 
-本文到这里为止。下一篇再进入 Tick、延时链表和时间片触发条件，回答：
+本文到这里为止。004 已经进入 Tick、延时链表和时间片触发条件，回答：
 
 ```
 Blocked Task 如何因为时间到期重新回到 ReadyList？
